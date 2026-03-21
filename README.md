@@ -1,56 +1,137 @@
 # OAK-D Lite Playground
 
-Raspberry Pi 5 + OAK-D Lite を使った顔認証・深度計測の実験コード。
+Raspberry Pi 5 + OAK-D Lite による顔認証・深度計測の実験リポジトリ。
 
-## 環境
+## ハードウェア構成
 
-- Raspberry Pi 5
-- OAK-D Lite (USB 3.0接続)
+- Raspberry Pi 5 (8GB)
+- OAK-D Lite — USB 3.0（青ポート）に接続
+
+## ソフトウェア環境
+
 - Python 3.11
-- depthai 2.27.0
+- depthai **2.27.0**（3.x は ISP firmware クラッシュあり → 2.x を使うこと）
+- OpenCV 4.x
 
 ## セットアップ
+
+### 1. USB 権限
+
+```bash
+echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", MODE="0666"' | sudo tee /etc/udev/rules.d/80-movidius.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+### 2. Pi 5 の USB 電力制限を解除
+
+`/boot/firmware/config.txt` の `[all]` セクションに追記して再起動：
+
+```
+usb_max_current_enable=1
+```
+
+### 3. 仮想環境と依存パッケージ
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install depthai==2.27.0 opencv-python Pillow blobconverter
-
-# SFaceモデル
-curl -L 'https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx' -o face_recognition_sface.onnx
-
-# YuNetモデル
-curl -L 'https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx' -o face_detection_yunet_2023mar.onnx
 ```
 
-## スクリプト
+### 4. モデルのダウンロード
+
+```bash
+# SFace（顔認証）
+curl -L 'https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx' \
+  -o face_recognition_sface.onnx
+
+# YuNet（顔アライメント用ランドマーク検出）
+curl -L 'https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx' \
+  -o face_detection_yunet_2023mar.onnx
+```
+
+---
+
+## スクリプト一覧
 
 | スクリプト | 説明 |
 |---|---|
-| `check_device.py` | デバイス接続確認 |
-| `capture.py` | RGB + Depth スナップショット保存 |
-| `live_view.py` | RGB + Depth リアルタイム表示 |
-| `live_rgb.py` | RGB のみリアルタイム表示 |
+| `check_device.py` | デバイス接続確認（カメラ一覧表示） |
+| `capture.py` | RGB + Depth のスナップショットを `/tmp/` に保存 |
+| `live_view.py` | RGB + Depth のリアルタイム表示 |
+| `live_rgb.py` | RGB のみのリアルタイム表示 |
 | `face_recognition.py` | 顔認証（手動深度取得版） |
-| `face_recognition_spatial.py` | 顔認証（SpatialDetectionNetwork版・推奨） |
+| `face_recognition_spatial.py` | 顔認証（SpatialDetectionNetwork 版・**推奨**） |
 
-## 顔認証の使い方
+---
+
+## 顔認証（face_recognition_spatial.py）
+
+### パイプライン
+
+```
+OAK VPU:
+  ColorCamera (CAM_A, RGB)
+    └─ ImageManip (300x300)
+         └─ MobileNetSpatialDetectionNetwork ─── 顔検出 + 距離取得
+                └─ ObjectTracker ──────────────── 追尾 (track_id付与)
+  MonoCamera (CAM_B) + MonoCamera (CAM_C)
+    └─ StereoDepth ──────────────────────────── 深度マップ生成
+  MonoCamera (CAM_B)
+    └─ NIR映像 (940nm照明使用時)
+
+Pi CPU:
+  YuNet ─ 顔ランドマーク検出 (5点)
+    └─ alignCrop() ─ 顔アライメント
+         └─ SFace ─ 128次元埋め込み → コサイン類似度マッチング
+```
+
+### 使い方
 
 ```bash
 source venv/bin/activate
 DISPLAY=:0 python3 face_recognition_spatial.py
+```
 
-# 操作
-#   r : 顔を登録（名前入力）
-#   m : RGB ↔ NIR モード切り替え
-#   q : 終了
+| キー | 動作 |
+|---|---|
+| `r` | 顔を登録（名前を入力） |
+| `m` | RGB ↔ NIR モード切り替え |
+| `q` | 終了 |
 
-# DB リセット
+```bash
+# 登録データをリセット
 rm face_db.pkl
 ```
 
-## 注意
+### チューニングパラメータ
 
-- depthai 3.x は ISP firmware クラッシュあり → 2.27.0 を使う
-- Pi 5 は usb_max_current_enable=1 が必要（/boot/firmware/config.txt）
-- OAK-D Lite に IR カメラなし。NIR は 940nm 外部照明 + モノカメラで対応
+```python
+MIN_FACE_WIDTH       = 80     # 認証する最小顔幅 (px)
+SIMILARITY_THRESHOLD = 0.65   # 同一人物判定ライン (0〜1、高いほど厳しい)
+DEPTH_MIN_MM         = 200    # 深度マップ表示の最小距離 (mm)
+DEPTH_MAX_MM         = 5000   # 深度マップ表示の最大距離 (mm)
+```
+
+### 精度向上のコツ
+
+- 登録は **NIR モード**（`m` キーで切替）で行うと、昼夜どちらでも認識精度が高い
+- 同じ人を複数アングル（正面・左・右）で登録すると角度変化への耐性が上がる
+- 精度が低い場合は `SIMILARITY_THRESHOLD` を `0.55` 程度に下げて試す
+
+### 既知の制限
+
+- OAK-D Lite は IR カメラ非搭載。NIR 撮影は **940nm 外部照明 + モノカメラ** で代替
+- SFace は RGB 訓練モデルのため、NIR モードでは精度がやや低下する場合がある
+- ステレオ深度はテクスチャの少ない面（壁・天井）で不安定になる
+
+---
+
+## モデル・ライセンス
+
+| モデル | ライセンス | 商用利用 |
+|---|---|---|
+| face-detection-retail-0004 (Intel) | Apache 2.0 | ✅ |
+| SFace | Apache 2.0 | ✅ |
+| YuNet | MIT | ✅ |
+| ArcFace (未使用) | 非商用のみ | ❌ |
