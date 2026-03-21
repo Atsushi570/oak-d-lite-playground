@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore")
 use_mono = False  # m キーでトグル
 
 # ─── 設定 ─────────────────────────────────────────────
-MIN_FACE_WIDTH   = 80      # 認証する最小顔幅 (px)
+MIN_FACE_WIDTH   = 40      # 認証する最小顔幅 (px)
 ASPECT_RATIO_MIN = 0.75    # 顔BBoxの縦横比 (正面は 0.9〜1.2 程度)
 ASPECT_RATIO_MAX = 1.4
 SIMILARITY_THRESHOLD = 0.65  # 類似度しきい値（大きい=類似）
@@ -74,6 +74,7 @@ def match(emb):
             if score > best_sim:
                 best_sim = score
                 best_name = name
+    print(f"[MATCH] best={best_name} sim={best_sim:.3f} (threshold={SIMILARITY_THRESHOLD})", flush=True)
     return best_name, best_sim
 
 def is_quality_face(x1, y1, x2, y2, frame_w, frame_h):
@@ -135,6 +136,13 @@ manip.initialConfig.setResize(300, 300)
 manip.initialConfig.setFrameType(dai.RawImgFrame.Type.BGR888p)
 cam_color.preview.link(manip.inputImage)
 
+
+def _get_face_crop(frame, x1, y1, x2, y2):
+    """顔クロップ（NIR検出時はBBoxがNIR座標なのでパディング不要）"""
+    h, w = frame.shape[:2]
+    crop = frame[max(0,y1):min(h,y2), max(0,x1):min(w,x2)]
+    return crop if crop.size > 0 else frame[0:1, 0:1]
+
 blob_path = str(
     __import__('blobconverter').from_zoo(
         name="face-detection-retail-0004",
@@ -188,6 +196,7 @@ with dai.Device(pipeline) as device:
     q_depth  = device.getOutputQueue("depth",     maxSize=4, blocking=False)
 
     frame = None
+    rgb_frame = None  # 認証・登録用（常にRGB）
     last_tracklets = None
     last_depth_frame = None
     while True:
@@ -204,6 +213,7 @@ with dai.Device(pipeline) as device:
         else:
             if in_rgb:
                 frame = in_rgb.getCvFrame()
+                rgb_frame = frame  # RGBを常時キープ
 
         # Depth フレーム取得（可視化用のみ）
         in_depth = q_depth.tryGet()
@@ -237,7 +247,7 @@ with dai.Device(pipeline) as device:
 
                 # 質フィルタ通過 → 認証
                 if quality:
-                    face_crop = frame[y1:y2, x1:x2]
+                    face_crop = _get_face_crop(frame, x1, y1, x2, y2)
                     if face_crop.size > 0:
                         emb = get_embedding(face_crop)
                         if face_db:
