@@ -84,66 +84,88 @@ hf_hub_download(repo_id='fal/AuraFace-v1', filename='glintr100.onnx', local_dir=
 
 ---
 
-## アーキテクチャ：VPU vs ホスト
+## パイプライン構成
 
 ### face_recognition_spatial_v3.py（SFace）
 
-```
-┌─────────────────────────────── OAK-D Lite VPU (MyriadX) ───────────────────────────────┐
-│                                                                                          │
-│  CAM_A (RGB)                          CAM_B (NIR/左)          CAM_C (右)                │
-│  640x400 BGR                          640x400 GRAY            640x400 GRAY              │
-│      │                                     │                       │                    │
-│      ├─→ [表示用キュー]                    ├─→ [表示用キュー]     │                    │
-│      │                                     │                       │                    │
-│      └─→ ImageManip(300x300 BGR)           └─→ ImageManip(300x300 BGR)                 │
-│               │                                      │                                  │
-│          NeuralNetwork                           NeuralNetwork    ↓                    │
-│      (face-detection-retail-0004)         (face-detection-retail-0004)                  │
-│          [RGB検出NN]                          [NIR検出NN]      StereoDepth              │
-│               │                                      │          640x400                 │
-│          [RGBキュー]                         [NIRキュー]      [深度キュー]              │
-└──────────────────────────────────────────────────────────────────────────────────────┘
-                              ↓ USB3
-┌─────────────────────── Raspberry Pi 5 ホスト ─────────────────────────────────────────┐
-│                                                                                          │
-│  モード切替(m):  RGB → RGBキュー    NIR → NIRキュー                                     │
-│                                                                                          │
-│  SSD手動パース  (1,1,200,7) → conf/bbox デコード                                        │
-│       │                                                                                  │
-│  IoUトラッキング  track_id の割当・管理                                                  │
-│       │                                                                                  │
-│  YuNet  顔ランドマーク検出 → alignCrop (112x112)                                        │
-│       │                                                                                  │
-│  SFace  128次元埋め込み → cosine similarity → DBマッチング                              │
-│       │                                                                                  │
-│  深度フレーム  BBox中心 15x15px の中央値 → 距離 (mm)                                   │
-│       │                                                                                  │
-│  表示  BBox / ID / 認証結果(name sim:0.xx OK/NG) / 距離                                │
-└──────────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph VPU["🔶 OAK-D Lite VPU (MyriadX)"]
+        direction TB
+        CAM_A["CAM_A\nRGB 640×400"]
+        CAM_B["CAM_B\nNIR 640×400"]
+        CAM_C["CAM_C\n右 640×400"]
+
+        CAM_A -->|"BGR888p"| q_rgb["キュー: q_rgb\n表示用"]
+        CAM_A -->|"BGR888p"| manip_rgb["ImageManip\n→ 300×300"]
+        manip_rgb --> nn_rgb["NeuralNetwork\nface-detection-retail-0004\nRGB検出NN"]
+        nn_rgb --> q_nn["キュー: q_nn"]
+
+        CAM_B -->|"GRAY8"| q_mono["キュー: q_mono\n表示用"]
+        CAM_B -->|"BGR888p"| manip_nir["ImageManip\n→ 300×300"]
+        manip_nir --> nn_nir["NeuralNetwork\nface-detection-retail-0004\nNIR検出NN"]
+        nn_nir --> q_nn_nir["キュー: q_nn_nir"]
+
+        CAM_B -->|"left"| stereo["StereoDepth\n640×400\ndepthAlign=CAM_A"]
+        CAM_C -->|"right"| stereo
+        stereo --> q_depth["キュー: q_depth"]
+    end
+
+    subgraph Host["🔷 Raspberry Pi 5 ホスト"]
+        direction TB
+        switch{"m キー\nモード切替"}
+        q_nn -->|"RGB モード"| switch
+        q_nn_nir -->|"NIR モード"| switch
+
+        switch --> parse["SSD 手動パース\ngetTensor('detection_out')\nreshape(-1, 7)"]
+        parse --> track["host-side IoU トラッキング\ntrack_id 割当・TTL管理"]
+        track --> yunet["YuNet\n顔ランドマーク検出\n→ alignCrop 112×112"]
+        yunet --> sface["SFace\ncosine similarity\n→ DB マッチング"]
+        sface --> display["表示\nBBox / ID / 認証結果\nsim:0.xx OK/NG"]
+
+        q_depth --> depth["深度 ROI\nBBox中心 15×15px 中央値\n→ 距離 mm"]
+        depth --> display
+    end
+
+    VPU -->|USB 3.0| Host
 ```
 
 ### face_recognition_auraface.py（AuraFace）
 
-SFace 版と同じパイプライン構成。顔認証部分のみ異なる：
+VPU パイプラインは SFace 版と同一。ホスト側の推論部分が異なる：
 
-```
-┌─── ホスト メインスレッド ─────────────────────────────────────────────────┐
-│  顔検出 → IoUトラッキング → 表示 (常時 ~10fps)                             │
-│       │                                                                     │
-│       └─→ embed_queue.put_nowait(tid, face_crop)  ← rate limit: 1.5秒/顔 │
-└───────────────────────────────────────────────────────────────────────────┘
-                              ↓ (非同期)
-┌─── ホスト 埋め込みスレッド ────────────────────────────────────────────────┐
-│  AuraFace (glintr100.onnx / ResNet100)                                      │
-│  前処理: BGR→RGB, 正規化 (x-127.5)/128, NCHW                               │
-│  ONNX Runtime (CPU) → 512次元埋め込み → L2正規化                           │
-│  cosine similarity → DBマッチング → track_results に書き込み               │
-│  推論時間: ~330ms/枚                                                        │
-└───────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph VPU["🔶 OAK-D Lite VPU (MyriadX)"]
+        direction LR
+        note["SFace 版と同一パイプライン\n（RGB/NIR 切替・StereoDepth）"]
+    end
+
+    subgraph Host["🔷 Raspberry Pi 5 ホスト"]
+        direction TB
+
+        subgraph main["メインスレッド（~10fps）"]
+            det["顔検出 + IoU トラッキング"]
+            det -->|"新規/更新 tracklet\n1.5秒以上経過"| enq["embed_queue.put_nowait()\nフルなら即スキップ"]
+            det --> disp["表示ループ\nBBox / 認証結果キャッシュ表示"]
+        end
+
+        subgraph worker["埋め込みスレッド（~3fps）"]
+            deq["embed_queue から取得"]
+            deq --> pre["前処理\nBGR→RGB, 112×112\n(x-127.5)/128, NCHW"]
+            pre --> ort["ONNX Runtime\nglintr100.onnx\nResNet100\n~330ms/枚"]
+            ort --> l2["L2 正規化\n512次元埋め込み"]
+            l2 --> match["cosine similarity\n→ DB マッチング"]
+            match --> cache["track_results に書き込み\n(thread-safe)"]
+        end
+
+        cache -->|"最新結果を参照"| disp
+    end
+
+    VPU -->|USB 3.0| Host
 ```
 
-**AuraFace vs SFace 比較**
+### SFace vs AuraFace
 
 | | SFace | AuraFace |
 |---|---|---|
@@ -152,7 +174,6 @@ SFace 版と同じパイプライン構成。顔認証部分のみ異なる：
 | 推論時間 (Pi 5 CPU) | ~20ms | ~330ms |
 | 埋め込み次元 | 128 | 512 |
 | ライセンス | Apache 2.0 | Apache 2.0 |
-| 認証方式 | cosine similarity (高いほど類似) | cosine similarity (高いほど類似) |
 | デフォルト閾値 | sim > 0.65 | sim > 0.65 |
 
 ---
@@ -176,7 +197,7 @@ DISPLAY=:0 python3 face_recognition_spatial.py
 | キー | 動作 |
 |---|---|
 | `r` | 顔を登録（名前を入力） |
-| `m` | RGB ↔ NIR モード切り替え（検出NNも切替） |
+| `m` | RGB ↔ NIR モード切り替え（検出 NN も切替） |
 | `q` | 終了 |
 
 ```bash
