@@ -10,6 +10,15 @@ OAK-D Lite 顔認証 - depthai 3.x 対応版
 """
 import depthai as dai
 import numpy as np
+
+# ─── ヘッドポーズ推定用 3D 顔モデル（mm単位、鼻先を原点）────────────────────
+FACE_3D_MODEL = np.array([
+    [ 0.0,   0.0,   0.0 ],   # 鼻先
+    [-30.0, -28.0, -30.0],   # 左目
+    [ 30.0, -28.0, -30.0],   # 右目
+    [-22.0,  25.0, -30.0],   # 左口角
+    [ 22.0,  25.0, -30.0],   # 右口角
+], dtype=np.float64)
 import cv2
 import warnings
 import os
@@ -98,6 +107,69 @@ def _get_face_crop(frame, x1, y1, x2, y2):
     h, w = frame.shape[:2]
     crop = frame[max(0,y1):min(h,y2), max(0,x1):min(w,x2)]
     return crop if crop.size > 0 else frame[0:1, 0:1]
+
+def estimate_pose(frame, x1, y1, x2, y2):
+    """YuNet + solvePnP でヘッドポーズ（Yaw/Pitch/Roll）を推定"""
+    crop = _get_face_crop(frame, x1, y1, x2, y2)
+    ch, cw = crop.shape[:2]
+    if ch < 20 or cw < 20:
+        return None
+
+    face_detector.setInputSize((cw, ch))
+    _, faces = face_detector.detect(crop)
+    if faces is None or len(faces) == 0:
+        return None
+
+    lm = faces[0][4:14].reshape(5, 2)  # 右目/左目/鼻/右口/左口 (crop座標)
+
+    # 2D: solvePnP の対応点（3Dモデルと同順: 鼻/左目/右目/左口/右口）
+    image_pts = np.array([
+        lm[2], lm[1], lm[0], lm[4], lm[3]
+    ], dtype=np.float64)
+
+    fh, fw = frame.shape[:2]
+    focal = float(fw)
+    cam_mat = np.array([
+        [focal, 0,     fw / 2.0],
+        [0,     focal, fh / 2.0],
+        [0,     0,     1.0     ],
+    ], dtype=np.float64)
+
+    # crop→frame 座標へオフセット（表示用ランドマーク）
+    ox, oy = max(0, x1), max(0, y1)
+    lm_frame = (lm + np.array([ox, oy])).astype(int)
+
+    # solvePnP（crop 座標系で解く → 画角は同一なので cam_mat はフレーム基準でOK）
+    image_pts_frame = image_pts + np.array([ox, oy])
+    ok, rvec, tvec = cv2.solvePnP(
+        FACE_3D_MODEL, image_pts_frame, cam_mat,
+        np.zeros((4, 1)), flags=cv2.SOLVEPNP_EPNP)
+    if not ok:
+        return None
+
+    # 回転行列 → Euler 角
+    rmat, _ = cv2.Rodrigues(rvec)
+    sy = np.sqrt(rmat[0, 0]**2 + rmat[1, 0]**2)
+    if sy > 1e-6:
+        pitch = np.degrees(np.arctan2(-rmat[2, 0], sy))
+        yaw   = np.degrees(np.arctan2( rmat[1, 0], rmat[0, 0]))
+        roll  = np.degrees(np.arctan2( rmat[2, 1], rmat[2, 2]))
+    else:
+        pitch = np.degrees(np.arctan2(-rmat[2, 0], sy))
+        yaw   = 0.0
+        roll  = np.degrees(np.arctan2(-rmat[1, 2], rmat[1, 1]))
+
+    # 3軸を投影（origin=鼻先, X=赤, Y=緑, Z=青）
+    axis_3d = np.float32([[0,0,0],[50,0,0],[0,-50,0],[0,0,-50]])
+    axis_2d, _ = cv2.projectPoints(axis_3d, rvec, tvec, cam_mat, np.zeros((4,1)))
+    axis_2d = axis_2d.reshape(-1, 2).astype(int)
+
+    return {
+        "yaw": yaw, "pitch": pitch, "roll": roll,
+        "axis_2d": axis_2d,
+        "landmarks": lm_frame,
+    }
+
 
 # ─── Blob ─────────────────────────────────────────────
 blob_path = str(__import__('blobconverter').from_zoo(
@@ -248,6 +320,18 @@ with dai.Device() as device:
                 cv2.putText(display, f"ID:{tid}", (x1, y1-5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
+                # ヘッドポーズ推定
+                pose = estimate_pose(frame, x1, y1, x2, y2)
+                if pose:
+                    ax = pose["axis_2d"]
+                    org = tuple(ax[0])
+                    cv2.line(display, org, tuple(ax[1]), (0,   0, 255), 2)  # X: 赤
+                    cv2.line(display, org, tuple(ax[2]), (0, 255,   0), 2)  # Y: 緑
+                    cv2.line(display, org, tuple(ax[3]), (255,  0,   0), 2)  # Z: 青
+                    cv2.putText(display,
+                                f"Y:{pose['yaw']:+.0f} P:{pose['pitch']:+.0f} R:{pose['roll']:+.0f}",
+                                (x1, y2+18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0), 1)
+
                 if quality:
                     face_crop = _get_face_crop(frame, x1, y1, x2, y2)
                     if face_crop.size > 0:
@@ -289,7 +373,7 @@ with dai.Device() as device:
                             lbl, lclr = f"Unknown sim:{rsim:.2f}", (0, 80, 255)
                         else:
                             lbl, lclr = f"{rname} sim:{rsim:.2f} OK", (0, 255, 0)
-                        cv2.putText(display, lbl, (x1, y2+18),
+                        cv2.putText(display, lbl, (x1, y2+36),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, lclr, 2)
 
             # 凡例・モード
