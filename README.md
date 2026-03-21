@@ -134,4 +134,3 @@ DEPTH_MAX_MM         = 5000   # 深度マップ表示の最大距離 (mm)
 | face-detection-retail-0004 (Intel) | Apache 2.0 | ✅ |
 | SFace | Apache 2.0 | ✅ |
 | YuNet | MIT | ✅ |
-| ArcFace (未使用) | 非商用のみ | ❌ |
