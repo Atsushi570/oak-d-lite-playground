@@ -38,6 +38,8 @@ DB_PATH              = "face_db.pkl"
 DEPTH_MIN_MM         = 200
 DEPTH_MAX_MM         = 5000
 RESULT_TTL           = 2.0
+LIVENESS_DEPTH_STD_MIN = 12.0   # 平面残差 std(mm)の下限
+LIVENESS_VALID_RATIO   = 0.3    # 有効深度ピクセル比率の下限
 TRACK_IOU_THRESH     = 0.3
 TRACK_TTL            = 1.0
 
@@ -169,6 +171,42 @@ def estimate_pose(frame, x1, y1, x2, y2):
         "axis_2d": axis_2d,
         "landmarks": lm_frame,
     }
+
+
+def check_liveness_depth(depth_frame, x1, y1, x2, y2):
+    """深度平面フィッティングで liveness 判定。
+    実顔(凹凸あり)='LIVE', 平面(写真/画面)='SPOOF', 判定不能=None"""
+    if depth_frame is None:
+        return None
+    dh, dw = depth_frame.shape[:2]
+    roi = depth_frame[max(0, y1):min(dh, y2), max(0, x1):min(dw, x2)]
+    if roi.size == 0:
+        return None
+
+    total_pixels = roi.size
+    valid_mask = (roi > 100) & (roi < 10000)
+    valid_ratio = np.count_nonzero(valid_mask) / total_pixels
+
+    # 有効率 < 10% → 反射面 (SPOOF)
+    if valid_ratio < 0.1:
+        return "SPOOF"
+
+    valid_vals = roi[valid_mask]
+    med = np.median(valid_vals)
+
+    # 中央値 ± 200mm で背景排除
+    ys, xs = np.where(valid_mask & (np.abs(roi - med) < 200))
+    if len(ys) / total_pixels < LIVENESS_VALID_RATIO:
+        return None
+
+    z = roi[ys, xs].astype(np.float64)
+    A = np.column_stack([xs.astype(np.float64), ys.astype(np.float64),
+                         np.ones(len(xs))])
+    result = np.linalg.lstsq(A, z, rcond=None)
+    residuals = z - A @ result[0]
+    std = np.std(residuals)
+
+    return "LIVE" if std >= LIVENESS_DEPTH_STD_MIN else "SPOOF"
 
 
 # ─── Blob ─────────────────────────────────────────────
@@ -315,10 +353,19 @@ with dai.Device() as device:
 
             for tid, (x1, y1, x2, y2) in matched_dets.items():
                 quality = is_quality_face(x1, y1, x2, y2, fw, fh)
-                color = (0, 200, 0)  # 常に緑（品質フィルタは認証可否のみに使用）
+                liveness = check_liveness_depth(last_depth_frame, x1, y1, x2, y2)
+                if liveness == "LIVE":
+                    color = (0, 200, 0)
+                elif liveness == "SPOOF":
+                    color = (0, 0, 255)
+                else:
+                    color = (0, 200, 200)
                 cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(display, f"ID:{tid}", (x1, y1-5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                if liveness:
+                    cv2.putText(display, liveness, (x1, y1-20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                 # ヘッドポーズ推定
                 pose = estimate_pose(frame, x1, y1, x2, y2)
@@ -332,7 +379,7 @@ with dai.Device() as device:
                                 f"Y:{pose['yaw']:+.0f} P:{pose['pitch']:+.0f} R:{pose['roll']:+.0f}",
                                 (x1, y2+18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0), 1)
 
-                if quality:
+                if quality and liveness != "SPOOF":
                     face_crop = _get_face_crop(frame, x1, y1, x2, y2)
                     if face_crop.size > 0:
                         emb = get_embedding(face_crop)
