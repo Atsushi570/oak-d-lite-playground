@@ -24,8 +24,17 @@ import warnings
 import os
 import pickle
 import time
+import argparse
 import onnxruntime as ort
 warnings.filterwarnings("ignore")
+
+# ─── 引数 ──────────────────────────────────────────────
+ap = argparse.ArgumentParser()
+ap.add_argument("--antispoof", action="store_true",
+                help="MiniFASNetV2 による RGB anti-spoof を有効化（デフォルト: 無効）")
+ap.add_argument("--name", default=None, help="起動時に登録する名前")
+args = ap.parse_args()
+USE_ANTISPOOF = args.antispoof
 
 use_mono = False
 
@@ -436,21 +445,27 @@ with dai.Device() as device:
                     rgb_bbox = best_rgb_bbox or (x1, y1, x2, y2)
                 dx1, dy1, dx2, dy2 = rgb_bbox
                 depth_live, depth_stats = check_liveness_depth(last_depth_frame, dx1, dy1, dx2, dy2)
-                # per-track NN 推論 (1.5秒に1回)
-                if quality and (now - last_nn_ts.get(tid, 0)) > 1.5:
-                    face_crop_spoof = _get_face_crop(frame, x1, y1, x2, y2)
-                    if face_crop_spoof.size > 0:
-                        nn_result_cache[tid] = check_liveness_nn(face_crop_spoof)
-                        last_nn_ts[tid] = now
-                nn_result = nn_result_cache.get(tid)
-                # マルチモーダル判定
-                # depth=None は「判定不能」= 安全側に倒す（LIVE とは断言しない）
-                if nn_result == "SPOOF" or depth_live == "SPOOF":
-                    liveness = "SPOOF"
-                elif nn_result == "LIVE" and depth_live == "LIVE":
-                    liveness = "LIVE"
+                # per-track NN 推論 (--antispoof 指定時のみ)
+                nn_result = None
+                if USE_ANTISPOOF:
+                    if quality and (now - last_nn_ts.get(tid, 0)) > 1.5:
+                        face_crop_spoof = _get_face_crop(frame, x1, y1, x2, y2)
+                        if face_crop_spoof.size > 0:
+                            nn_result_cache[tid] = check_liveness_nn(face_crop_spoof)
+                            last_nn_ts[tid] = now
+                    nn_result = nn_result_cache.get(tid)
+                # 判定ロジック
+                if USE_ANTISPOOF:
+                    # マルチモーダル: depth=None は判定保留（LIVE と断言しない）
+                    if nn_result == "SPOOF" or depth_live == "SPOOF":
+                        liveness = "SPOOF"
+                    elif nn_result == "LIVE" and depth_live == "LIVE":
+                        liveness = "LIVE"
+                    else:
+                        liveness = None
                 else:
-                    liveness = None  # どちらか不明 → 判定保留
+                    # 深度のみ
+                    liveness = depth_live  # "LIVE" / "SPOOF" / None
                 if liveness == "LIVE":
                     color = (0, 200, 0)
                 elif liveness == "SPOOF":
