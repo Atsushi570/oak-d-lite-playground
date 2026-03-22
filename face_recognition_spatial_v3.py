@@ -261,6 +261,8 @@ track_results      = {}
 last_depth_cache   = {}
 nn_result_cache    = {}   # {tid: "LIVE"/"SPOOF"/None}
 last_nn_ts         = {}   # {tid: timestamp} rate limit 用
+last_pose_ts       = {}   # {tid: timestamp} ヘッドポーズ rate limit 用
+pose_cache         = {}   # {tid: pose} キャッシュ
 
 print("[RGB mode] (m で NIR に切替)")
 print("起動中... (3秒待機)")
@@ -401,6 +403,8 @@ with dai.Device() as device:
                 track_results.pop(tid, None)
                 nn_result_cache.pop(tid, None)
                 last_nn_ts.pop(tid, None)
+                last_pose_ts.pop(tid, None)
+                pose_cache.pop(tid, None)
 
         # RGB tracks 更新（depth チェック用・常に CAM_A 座標）
         for bbox in rgb_current_dets:
@@ -492,8 +496,13 @@ with dai.Device() as device:
                     cv2.putText(display, txt2, (x1+2, y2-5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, stat_color, 1)
 
-                # ヘッドポーズ推定
-                pose = estimate_pose(frame, x1, y1, x2, y2)
+                # ヘッドポーズ推定（0.5秒に1回）
+                if quality and (now - last_pose_ts.get(tid, 0)) > 0.5:
+                    p = estimate_pose(frame, x1, y1, x2, y2)
+                    if p:
+                        pose_cache[tid] = p
+                    last_pose_ts[tid] = now
+                pose = pose_cache.get(tid)
                 if pose:
                     ax = pose["axis_2d"]
                     org = tuple(ax[0])
