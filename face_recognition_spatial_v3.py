@@ -516,7 +516,7 @@ with dai.Device() as device:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, stat_color, 1)
 
                 # ヘッドポーズ推定（0.5秒に1回）
-                if quality and (now - last_pose_ts.get(tid, 0)) > 2.0:
+                if quality and (now - last_pose_ts.get(tid, 0)) > 0.1:
                     pose_result = estimate_pose(frame, x1, y1, x2, y2)
                     if pose_result:
                         pose_cache[tid] = pose_result
