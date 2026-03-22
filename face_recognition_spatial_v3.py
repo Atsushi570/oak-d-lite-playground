@@ -43,7 +43,8 @@ TRACK_IOU_THRESH     = 0.3
 TRACK_TTL            = 1.0
 
 # ─── host-side tracking ───────────────────────────────
-host_tracks   = {}   # {tid: {'bbox': (x1,y1,x2,y2), 'last_seen': float}}
+host_tracks     = {}   # {tid: {'bbox': (x1,y1,x2,y2), 'last_seen': float}}
+rgb_host_tracks = {}   # depth チェック用: 常に RGB(CAM_A) 座標の BBox を管理
 next_track_id = [0]
 
 def calc_iou(a, b):
@@ -173,30 +174,38 @@ def estimate_pose(frame, x1, y1, x2, y2):
 
 
 def check_liveness_depth(depth_frame, x1, y1, x2, y2, border=30):
-    """顔/背景 深度差分チェック"""
+    """顔/背景 深度差分チェック。常に (result_or_None, stats) を返す"""
     if depth_frame is None:
-        return None
+        return None, {"face": 0, "bg": 0, "diff": 0, "std": 0.0, "fpx": 0}
     dh, dw = depth_frame.shape[:2]
-    # 顔領域
     fx1, fy1 = max(0, x1), max(0, y1)
     fx2, fy2 = min(dw, x2), min(dh, y2)
     face_roi = depth_frame[fy1:fy2, fx1:fx2]
+    total_px = max(1, (fx2 - fx1) * (fy2 - fy1))
     face_valid = face_roi[(face_roi > 100) & (face_roi < 4000)]
-    if face_valid.size < 20:
-        return None
+    fpx = face_valid.size
+    valid_ratio = fpx / total_px
+    # 有効ピクセルが30%未満 = 反射面・近すぎ → SPOOF（取れない=怪しい）
+    if valid_ratio < 0.3:
+        face_depth = float(np.median(face_valid)) if fpx > 0 else 0
+        face_std = float(np.std(face_valid)) if fpx > 1 else 0.0
+        return "SPOOF", {"face": int(face_depth), "bg": 0, "diff": 0, "std": round(face_std, 1), "fpx": fpx, "ratio": round(valid_ratio, 2)}
     face_depth = float(np.median(face_valid))
-    # ボーダー領域 (BBox外周30px)
+    face_std = float(np.std(face_valid))
     bx1, by1 = max(0, x1 - border), max(0, y1 - border)
     bx2, by2 = min(dw, x2 + border), min(dh, y2 + border)
     bg_full = depth_frame[by1:by2, bx1:bx2].copy()
-    # 顔領域をマスク
     bg_full[fy1 - by1:fy2 - by1, fx1 - bx1:fx2 - bx1] = 0
     bg_valid = bg_full[(bg_full > 100) & (bg_full < 4000)]
     if bg_valid.size < 10:
-        return None
+        return None, {"face": int(face_depth), "bg": 0, "diff": 0, "std": round(face_std, 1), "fpx": fpx}
     bg_depth = float(np.median(bg_valid))
-    # 背景が150mm以上遠ければ前景判定
-    return "LIVE" if (bg_depth - face_depth) > 150 else "SPOOF"
+    diff = bg_depth - face_depth
+    # 実顔: std=27-33mm / スマホ(平面): std=0.6-1.4mm / 背景ノイズ混入: std=300mm+
+    # 上限100mmで背景混入を除外、下限15mmで平面を除外
+    result = "LIVE" if 15.0 < face_std < 100.0 else "SPOOF"
+    stats = {"face": int(face_depth), "bg": int(bg_depth), "diff": int(diff), "std": round(face_std, 1), "fpx": fpx, "ratio": round(valid_ratio, 2)}
+    return result, stats
 
 
 # ─── Anti-spoof (onnxruntime, host CPU) ──────────────
@@ -272,6 +281,7 @@ with dai.Device() as device:
     stereo.setOutputSize(640, 400)
     stereo.setLeftRightCheck(True)
     stereo.setSubpixel(True)
+    stereo.setExtendedDisparity(True)  # MinZ を ~40cm → ~20cm に改善
     stereo.initialConfig.postProcessing.speckleFilter.enable = True
     stereo.initialConfig.postProcessing.speckleFilter.speckleRange = 28
     stereo.initialConfig.postProcessing.temporalFilter.enable = True
@@ -329,22 +339,33 @@ with dai.Device() as device:
         if in_depth is not None:
             last_depth_frame = in_depth.getFrame().astype(np.float32)
 
-        # NN出力: SSD手動パース (1,1,200,7) → [img_id, label, conf, x1,y1,x2,y2]
-        in_nn = (q_nn_nir if use_mono else q_nn).tryGet()
-        current_dets = []
-        if in_nn is not None and frame is not None:
-            h, w = frame.shape[:2]
-            raw = np.array(in_nn.getTensor('detection_out')).reshape(-1, 7)
+        # NN出力: 常に両方読む（RGB=depth用、NIR=表示用）
+        in_nn_rgb = q_nn.tryGet()
+        in_nn_nir = q_nn_nir.tryGet()
+        in_nn = in_nn_nir if use_mono else in_nn_rgb
+
+        def parse_dets(in_nn_data, w, h):
+            if in_nn_data is None:
+                return []
+            dets = []
+            raw = np.array(in_nn_data.getTensor('detection_out')).reshape(-1, 7)
             for det in raw:
-                conf = float(det[2])
-                if conf < CONFIDENCE_THRESHOLD:
+                if float(det[2]) < CONFIDENCE_THRESHOLD:
                     continue
                 x1 = max(0, int(det[3] * w))
                 y1 = max(0, int(det[4] * h))
                 x2 = min(w, int(det[5] * w))
                 y2 = min(h, int(det[6] * h))
                 if x2 > x1 and y2 > y1:
-                    current_dets.append((x1, y1, x2, y2))
+                    dets.append((x1, y1, x2, y2))
+            return dets
+
+        current_dets = []
+        rgb_current_dets = []
+        if frame is not None:
+            h, w = frame.shape[:2]
+            current_dets = parse_dets(in_nn, w, h)
+            rgb_current_dets = parse_dets(in_nn_rgb, w, h)
 
         # host-side tracking
         now = time.time()
@@ -369,6 +390,27 @@ with dai.Device() as device:
                 nn_result_cache.pop(tid, None)
                 last_nn_ts.pop(tid, None)
 
+        # RGB tracks 更新（depth チェック用・常に CAM_A 座標）
+        for bbox in rgb_current_dets:
+            best_tid, best_iou = None, TRACK_IOU_THRESH
+            for tid, info in rgb_host_tracks.items():
+                iou = calc_iou(bbox, info['bbox'])
+                if iou > best_iou:
+                    best_iou, best_tid = iou, tid
+            if best_tid is None:
+                # 表示トラックと位置で対応付ける
+                for tid, info in host_tracks.items():
+                    iou = calc_iou(bbox, info['bbox'])
+                    if iou > TRACK_IOU_THRESH and tid not in rgb_host_tracks:
+                        best_tid = tid
+                        break
+                if best_tid is None:
+                    best_tid = f"rgb_{id(bbox)}"
+            rgb_host_tracks[best_tid] = {'bbox': bbox, 'last_seen': now}
+        for tid in list(rgb_host_tracks.keys()):
+            if now - rgb_host_tracks[tid]['last_seen'] > TRACK_TTL:
+                del rgb_host_tracks[tid]
+
         # 表示用: 常に host_tracks 全体から再構築（NN フレームが来ないときも BBox を維持）
         matched_dets = {tid: info['bbox'] for tid, info in host_tracks.items()}
 
@@ -379,7 +421,18 @@ with dai.Device() as device:
 
             for tid, (x1, y1, x2, y2) in matched_dets.items():
                 quality = is_quality_face(x1, y1, x2, y2, fw, fh)
-                depth_live = check_liveness_depth(last_depth_frame, x1, y1, x2, y2)
+                # depth は CAM_A(RGB) 座標 → RGB BBox を優先使用
+                rgb_bbox = rgb_host_tracks.get(tid, {}).get('bbox', None)
+                if rgb_bbox is None:
+                    # IoU で近い rgb track を探す
+                    best_rgb_bbox, best_iou = None, 0.3
+                    for rinfo in rgb_host_tracks.values():
+                        iou = calc_iou((x1,y1,x2,y2), rinfo['bbox'])
+                        if iou > best_iou:
+                            best_iou, best_rgb_bbox = iou, rinfo['bbox']
+                    rgb_bbox = best_rgb_bbox or (x1, y1, x2, y2)
+                dx1, dy1, dx2, dy2 = rgb_bbox
+                depth_live, depth_stats = check_liveness_depth(last_depth_frame, dx1, dy1, dx2, dy2)
                 # per-track NN 推論 (1.5秒に1回)
                 if quality and (now - last_nn_ts.get(tid, 0)) > 1.5:
                     face_crop_spoof = _get_face_crop(frame, x1, y1, x2, y2)
@@ -388,14 +441,13 @@ with dai.Device() as device:
                         last_nn_ts[tid] = now
                 nn_result = nn_result_cache.get(tid)
                 # マルチモーダル判定
+                # depth=None は「判定不能」= 安全側に倒す（LIVE とは断言しない）
                 if nn_result == "SPOOF" or depth_live == "SPOOF":
                     liveness = "SPOOF"
-                elif nn_result == "LIVE" and depth_live in ("LIVE", None):
-                    liveness = "LIVE"
-                elif nn_result is None and depth_live == "LIVE":
+                elif nn_result == "LIVE" and depth_live == "LIVE":
                     liveness = "LIVE"
                 else:
-                    liveness = None
+                    liveness = None  # どちらか不明 → 判定保留
                 if liveness == "LIVE":
                     color = (0, 200, 0)
                 elif liveness == "SPOOF":
@@ -409,6 +461,18 @@ with dai.Device() as device:
                     lbl_detail = f"{liveness} nn:{nn_result or '?'} d:{depth_live or '?'}"
                     cv2.putText(display, lbl_detail, (x1, y1-20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+                # 深度stats を BBox 内下部に常に重畳（None でも表示）
+                if depth_stats is not None:
+                    s = depth_stats
+                    # depth_liveがNoneの場合は赤みがかった色で警告表示
+                    stat_color = (200, 200, 0) if depth_live is not None else (80, 80, 255)
+                    ratio_pct = int(s.get('ratio', 0) * 100)
+                    txt1 = f"std:{s['std']}mm diff:{s['diff']:+d}mm ratio:{ratio_pct}%"
+                    txt2 = f"face:{s['face']}mm px:{s['fpx']}"
+                    cv2.putText(display, txt1, (x1+2, y2-18),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.38, stat_color, 1)
+                    cv2.putText(display, txt2, (x1+2, y2-5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.38, stat_color, 1)
 
                 # ヘッドポーズ推定
                 pose = estimate_pose(frame, x1, y1, x2, y2)
