@@ -270,6 +270,23 @@ time.sleep(3)
 print(f"登録済み: {list(face_db.keys())}")
 print("r=登録  m=モード切替  q=終了")
 
+def parse_dets(in_nn_data, w, h):
+    """SSD 出力を BBox リストに変換"""
+    if in_nn_data is None:
+        return []
+    dets = []
+    raw = np.array(in_nn_data.getTensor('detection_out')).reshape(-1, 7)
+    for det in raw:
+        if float(det[2]) < CONFIDENCE_THRESHOLD:
+            continue
+        x1 = max(0, int(det[3] * w))
+        y1 = max(0, int(det[4] * h))
+        x2 = min(w, int(det[5] * w))
+        y2 = min(h, int(det[6] * h))
+        if x2 > x1 and y2 > y1:
+            dets.append((x1, y1, x2, y2))
+    return dets
+
 with dai.Device() as device:
     p = dai.Pipeline(device)
 
@@ -295,7 +312,8 @@ with dai.Device() as device:
     stereo.setOutputSize(640, 400)
     stereo.setLeftRightCheck(True)
     stereo.setSubpixel(True)
-    stereo.setExtendedDisparity(True)  # MinZ を ~40cm → ~20cm に改善
+    # NOTE: setExtendedDisparity は setSubpixel と排他 → 削除
+    # MinZ は約40cm（400P相当）。0.4m未満は check_liveness_depth でフィルタ済み
     stereo.initialConfig.postProcessing.speckleFilter.enable = True
     stereo.initialConfig.postProcessing.speckleFilter.speckleRange = 28
     stereo.initialConfig.postProcessing.temporalFilter.enable = True
@@ -357,22 +375,6 @@ with dai.Device() as device:
         in_nn_rgb = q_nn.tryGet()
         in_nn_nir = q_nn_nir.tryGet()
         in_nn = in_nn_nir if use_mono else in_nn_rgb
-
-        def parse_dets(in_nn_data, w, h):
-            if in_nn_data is None:
-                return []
-            dets = []
-            raw = np.array(in_nn_data.getTensor('detection_out')).reshape(-1, 7)
-            for det in raw:
-                if float(det[2]) < CONFIDENCE_THRESHOLD:
-                    continue
-                x1 = max(0, int(det[3] * w))
-                y1 = max(0, int(det[4] * h))
-                x2 = min(w, int(det[5] * w))
-                y2 = min(h, int(det[6] * h))
-                if x2 > x1 and y2 > y1:
-                    dets.append((x1, y1, x2, y2))
-            return dets
 
         current_dets = []
         rgb_current_dets = []
