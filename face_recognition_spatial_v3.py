@@ -6,6 +6,7 @@ OAK-D Lite 顔認証 - depthai 3.x 対応版
 操作:
   r  : 顔を登録（名前を入力）
   m  : RGB <-> NIR モード切替
+  i  : 赤外線 LED ON/OFF（GPIO6）
   q  : 終了
 """
 import depthai as dai
@@ -26,6 +27,7 @@ import pickle
 import time
 import argparse
 import onnxruntime as ort
+import lgpio
 warnings.filterwarnings("ignore")
 
 # ─── 引数 ──────────────────────────────────────────────
@@ -37,6 +39,15 @@ args = ap.parse_args()
 USE_ANTISPOOF = args.antispoof
 
 use_mono = False
+
+# ─── 赤外線 LED（GPIO6、BCM）────────────────────────────
+IR_LED_GPIO = 6
+_gpio_h = lgpio.gpiochip_open(0)
+lgpio.gpio_claim_output(_gpio_h, IR_LED_GPIO, 0)  # 初期OFF
+ir_led_on = False
+
+def set_ir_led(state: bool):
+    lgpio.gpio_write(_gpio_h, IR_LED_GPIO, 1 if state else 0)
 
 # ─── 設定 ─────────────────────────────────────────────
 MIN_FACE_WIDTH       = 40
@@ -584,6 +595,10 @@ with dai.Device() as device:
             (tw, _), _ = cv2.getTextSize(mode_lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
             cv2.putText(display, mode_lbl, (fw-tw-10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+            ir_lbl = "[IR:ON]" if ir_led_on else "[IR:OFF]"
+            ir_color = (0, 200, 255) if ir_led_on else (100, 100, 100)
+            cv2.putText(display, ir_lbl, (fw-tw-10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, ir_color, 2)
             cv2.imshow("Face Recognition (SFace)", display)
 
         # Depth 可視化（5fps: 200ms ごとに更新）
@@ -602,7 +617,12 @@ with dai.Device() as device:
         wait_ms = 1 if matched_dets else 30
         key = cv2.waitKey(wait_ms) & 0xFF
 
-        if key == ord('m'):
+        if key == ord('i'):
+            ir_led_on = not ir_led_on
+            set_ir_led(ir_led_on)
+            print(f"IR LED: {'ON' if ir_led_on else 'OFF'}")
+
+        elif key == ord('m'):
             use_mono = not use_mono
             print(f"モード: {'NIR' if use_mono else 'RGB'}")
 
@@ -627,4 +647,6 @@ with dai.Device() as device:
             break
 
 cv2.destroyAllWindows()
+set_ir_led(False)
+lgpio.gpiochip_close(_gpio_h)
 print("終了")
