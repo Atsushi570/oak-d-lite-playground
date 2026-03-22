@@ -270,6 +270,20 @@ time.sleep(3)
 print(f"登録済み: {list(face_db.keys())}")
 print("r=登録  m=モード切替  q=終了")
 
+# ─── 深度ウィンドウ用カラーバーを起動時に1回だけ生成 ──────────────
+_DEPTH_WIN_H = 400
+_bar_w, _label_w = 30, 60
+_bar_vals = np.linspace(255, 0, _DEPTH_WIN_H).astype(np.uint8).reshape(_DEPTH_WIN_H, 1)
+_bar_color = cv2.applyColorMap(np.repeat(_bar_vals, _bar_w, axis=1), cv2.COLORMAP_JET)
+_label_area = np.zeros((_DEPTH_WIN_H, _label_w, 3), dtype=np.uint8)
+for _txt, _pos in [(f"{DEPTH_MIN_MM/1000:.1f}m", 0.05), ("1m", 1000), ("2m", 2000),
+                   ("3m", 3000), ("4m", 4000), (f"{DEPTH_MAX_MM/1000:.0f}m", 0.95)]:
+    _y = int(_pos * _DEPTH_WIN_H) if isinstance(_pos, float) else \
+         int((_pos - DEPTH_MIN_MM) / (DEPTH_MAX_MM - DEPTH_MIN_MM) * _DEPTH_WIN_H)
+    _y = max(12, min(_DEPTH_WIN_H - 4, _y))
+    cv2.putText(_label_area, _txt, (2, _y), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,255,255), 1)
+_DEPTH_SIDEBAR = np.hstack([_bar_color, _label_area])  # 再利用
+
 def parse_dets(in_nn_data, w, h):
     """SSD 出力を BBox リストに変換"""
     if in_nn_data is None:
@@ -349,8 +363,9 @@ with dai.Device() as device:
     q_depth = stereo.depth.createOutputQueue(maxSize=4, blocking=False)
     p.start()
 
-    frame           = None
+    frame            = None
     last_depth_frame = None
+    _last_depth_win_ts = 0.0
 
     while True:
         # フレーム取得
@@ -499,7 +514,7 @@ with dai.Device() as device:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, stat_color, 1)
 
                 # ヘッドポーズ推定（0.5秒に1回）
-                if quality and (now - last_pose_ts.get(tid, 0)) > 0.5:
+                if quality and (now - last_pose_ts.get(tid, 0)) > 2.0:
                     pose_result = estimate_pose(frame, x1, y1, x2, y2)
                     if pose_result:
                         pose_cache[tid] = pose_result
@@ -568,8 +583,9 @@ with dai.Device() as device:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
             cv2.imshow("Face Recognition (SFace)", display)
 
-        # Depth 可視化
-        if last_depth_frame is not None:
+        # Depth 可視化（5fps: 200ms ごとに更新）
+        if last_depth_frame is not None and (now - _last_depth_win_ts) > 0.2:
+            _last_depth_win_ts = now
             d = last_depth_frame
             invalid_mask = (d == 0) | (d >= 65535) | (d > DEPTH_MAX_MM)
             d_vis = np.clip((DEPTH_MAX_MM - d) / (DEPTH_MAX_MM - DEPTH_MIN_MM) * 255, 0, 255)
@@ -577,24 +593,7 @@ with dai.Device() as device:
             colored[invalid_mask] = 0
             for tid, (x1, y1, x2, y2) in matched_dets.items():
                 cv2.rectangle(colored, (x1, y1), (x2, y2), (255, 255, 255), 1)
-            # カラーバー凡例
-            ch = colored.shape[0]
-            bar_w, label_w = 30, 60
-            bar_vals = np.linspace(255, 0, ch).astype(np.uint8).reshape(ch, 1)
-            bar_gray = np.repeat(bar_vals, bar_w, axis=1)
-            bar_color = cv2.applyColorMap(bar_gray, cv2.COLORMAP_JET)
-            label_area = np.zeros((ch, label_w, 3), dtype=np.uint8)
-            labels = [(f"{DEPTH_MIN_MM/1000:.1f}m", 0.05), ("1m", 1000), ("2m", 2000),
-                      ("3m", 3000), ("4m", 4000), (f"{DEPTH_MAX_MM/1000:.0f}m", 0.95)]
-            for txt, pos in labels:
-                if isinstance(pos, float):
-                    y = int(pos * ch)
-                else:
-                    y = int((pos - DEPTH_MIN_MM) / (DEPTH_MAX_MM - DEPTH_MIN_MM) * ch)
-                y = max(12, min(ch - 4, y))
-                cv2.putText(label_area, txt, (2, y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-            cv2.imshow("Depth", np.hstack([colored, bar_color, label_area]))
+            cv2.imshow("Depth", np.hstack([colored, _DEPTH_SIDEBAR]))
 
         # 顔がいないときはスリープを長くして CPU 節約
         wait_ms = 1 if matched_dets else 30
