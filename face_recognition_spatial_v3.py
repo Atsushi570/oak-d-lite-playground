@@ -500,9 +500,9 @@ with dai.Device() as device:
 
                 # ヘッドポーズ推定（0.5秒に1回）
                 if quality and (now - last_pose_ts.get(tid, 0)) > 0.5:
-                    p = estimate_pose(frame, x1, y1, x2, y2)
-                    if p:
-                        pose_cache[tid] = p
+                    pose_result = estimate_pose(frame, x1, y1, x2, y2)
+                    if pose_result:
+                        pose_cache[tid] = pose_result
                     last_pose_ts[tid] = now
                 pose = pose_cache.get(tid)
                 if pose:
