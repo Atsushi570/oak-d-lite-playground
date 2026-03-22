@@ -24,6 +24,7 @@ import warnings
 import os
 import pickle
 import time
+import onnxruntime as ort
 warnings.filterwarnings("ignore")
 
 use_mono = False
@@ -191,24 +192,54 @@ def check_liveness_depth(depth_frame, x1, y1, x2, y2, border=30):
     # 顔領域をマスク
     bg_full[fy1 - by1:fy2 - by1, fx1 - bx1:fx2 - bx1] = 0
     bg_valid = bg_full[(bg_full > 100) & (bg_full < 4000)]
-    if bg_valid.size < 20:
+    if bg_valid.size < 10:
         return None
     bg_depth = float(np.median(bg_valid))
-    # 背景が200mm以上遠ければ前景判定
-    return "LIVE" if (bg_depth - face_depth) > 200 else "SPOOF"
+    # 背景が150mm以上遠ければ前景判定
+    return "LIVE" if (bg_depth - face_depth) > 150 else "SPOOF"
 
+
+# ─── Anti-spoof (onnxruntime, host CPU) ──────────────
+ANTISPOOF_MODEL = "anti_spoof_mn3.onnx"
+_spoof_sess = None
+
+def get_spoof_session():
+    global _spoof_sess
+    if _spoof_sess is None and os.path.exists(ANTISPOOF_MODEL):
+        _spoof_sess = ort.InferenceSession(ANTISPOOF_MODEL, providers=['CPUExecutionProvider'])
+    return _spoof_sess
+
+def check_liveness_nn(face_crop):
+    """MiniFASNetV2 (80x80, 3クラス) で顔クロップの liveness 判定"""
+    sess = get_spoof_session()
+    if sess is None:
+        return None
+    try:
+        resized = cv2.resize(face_crop, (80, 80))
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        inp = rgb.transpose(2, 0, 1)[np.newaxis]  # NCHW
+        input_name = sess.get_inputs()[0].name
+        logits = sess.run(None, {input_name: inp})[0].flatten()
+        # softmax → MiniFASNetV2: class 2=real/live
+        exp_logits = np.exp(logits - np.max(logits))
+        probs = exp_logits / exp_logits.sum()
+        real_prob = float(probs[2])
+        print(f"[ANTISPOOF] real={real_prob:.3f} probs={probs}", flush=True)
+        return "LIVE" if real_prob > 0.5 else "SPOOF"
+    except Exception as e:
+        print(f"[ANTISPOOF] error: {e}", flush=True)
+        return None
 
 # ─── Blob ─────────────────────────────────────────────
 import blobconverter
 blob_path = str(blobconverter.from_zoo(
     name="face-detection-retail-0004", shaves=6))
-antispoof_blob = str(blobconverter.from_zoo(
-    name="anti-spoof-mn3", shaves=6))
 
 # ─── 状態変数 ──────────────────────────────────────────
-track_results    = {}
-last_depth_cache = {}
-last_nn_live     = None   # anti-spoof NN の最新結果キャッシュ
+track_results      = {}
+last_depth_cache   = {}
+nn_result_cache    = {}   # {tid: "LIVE"/"SPOOF"/None}
+last_nn_ts         = {}   # {tid: timestamp} rate limit 用
 
 print("[RGB mode] (m で NIR に切替)")
 print("起動中... (3秒待機)")
@@ -268,23 +299,12 @@ with dai.Device() as device:
     det_nn_nir.setBlobPath(blob_path)
     manip_nir.out.link(det_nn_nir.input)
 
-    # ─── Anti-spoof NN (RGB全体を128x128にリサイズ) ──
-    rgb_spoof = cam_color.requestOutput((640, 400), type=dai.ImgFrame.Type.BGR888p, fps=10)
-    manip_spoof = p.create(dai.node.ImageManip)
-    manip_spoof.initialConfig.setOutputSize(128, 128)
-    manip_spoof.initialConfig.setFrameType(dai.ImgFrame.Type.BGR888p)
-    rgb_spoof.link(manip_spoof.inputImage)
-    nn_spoof = p.create(dai.node.NeuralNetwork)
-    nn_spoof.setBlobPath(antispoof_blob)
-    manip_spoof.out.link(nn_spoof.input)
-
     # ─── キュー ───────────────────────────────────────
     q_rgb   = rgb_disp.createOutputQueue(maxSize=4, blocking=False)
     q_mono  = mono_out_l.createOutputQueue(maxSize=4, blocking=False)
     q_nn     = det_nn.out.createOutputQueue(maxSize=4, blocking=False)
     q_nn_nir = det_nn_nir.out.createOutputQueue(maxSize=4, blocking=False)
     q_depth = stereo.depth.createOutputQueue(maxSize=4, blocking=False)
-    q_spoof = nn_spoof.out.createOutputQueue(maxSize=4, blocking=False)
     p.start()
 
     frame           = None
@@ -308,15 +328,6 @@ with dai.Device() as device:
         in_depth = q_depth.tryGet()
         if in_depth is not None:
             last_depth_frame = in_depth.getFrame().astype(np.float32)
-
-        # anti-spoof NN 出力
-        in_spoof = q_spoof.tryGet()
-        if in_spoof is not None:
-            try:
-                probs = np.array(in_spoof.getFirstTensor()).flatten()
-                last_nn_live = "LIVE" if probs[0] > 0.5 else "SPOOF"
-            except Exception:
-                pass  # tensor 取得失敗時はキャッシュを保持
 
         # NN出力: SSD手動パース (1,1,200,7) → [img_id, label, conf, x1,y1,x2,y2]
         in_nn = (q_nn_nir if use_mono else q_nn).tryGet()
@@ -355,6 +366,8 @@ with dai.Device() as device:
                 del host_tracks[tid]
                 last_depth_cache.pop(tid, None)
                 track_results.pop(tid, None)
+                nn_result_cache.pop(tid, None)
+                last_nn_ts.pop(tid, None)
 
         # 表示用: 常に host_tracks 全体から再構築（NN フレームが来ないときも BBox を維持）
         matched_dets = {tid: info['bbox'] for tid, info in host_tracks.items()}
@@ -367,7 +380,13 @@ with dai.Device() as device:
             for tid, (x1, y1, x2, y2) in matched_dets.items():
                 quality = is_quality_face(x1, y1, x2, y2, fw, fh)
                 depth_live = check_liveness_depth(last_depth_frame, x1, y1, x2, y2)
-                nn_result = last_nn_live
+                # per-track NN 推論 (1.5秒に1回)
+                if quality and (now - last_nn_ts.get(tid, 0)) > 1.5:
+                    face_crop_spoof = _get_face_crop(frame, x1, y1, x2, y2)
+                    if face_crop_spoof.size > 0:
+                        nn_result_cache[tid] = check_liveness_nn(face_crop_spoof)
+                        last_nn_ts[tid] = now
+                nn_result = nn_result_cache.get(tid)
                 # マルチモーダル判定
                 if nn_result == "SPOOF" or depth_live == "SPOOF":
                     liveness = "SPOOF"
