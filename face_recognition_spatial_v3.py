@@ -261,6 +261,7 @@ track_results      = {}
 last_depth_cache   = {}
 nn_result_cache    = {}   # {tid: "LIVE"/"SPOOF"/None}
 last_nn_ts         = {}   # {tid: timestamp} rate limit 用
+last_embed_ts      = {}   # {tid: timestamp} SFace rate limit 用
 last_pose_ts       = {}   # {tid: timestamp} ヘッドポーズ rate limit 用
 pose_cache         = {}   # {tid: pose} キャッシュ
 
@@ -422,6 +423,7 @@ with dai.Device() as device:
                 last_nn_ts.pop(tid, None)
                 last_pose_ts.pop(tid, None)
                 pose_cache.pop(tid, None)
+                last_embed_ts.pop(tid, None)
 
         # RGB tracks 更新（depth チェック用・常に CAM_A 座標）
         for bbox in rgb_current_dets:
@@ -530,7 +532,8 @@ with dai.Device() as device:
                                 f"Y:{pose['yaw']:+.0f} P:{pose['pitch']:+.0f} R:{pose['roll']:+.0f}",
                                 (x1, y2+18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0), 1)
 
-                if quality and liveness != "SPOOF":
+                if quality and liveness != "SPOOF" and (now - last_embed_ts.get(tid, 0)) > 1.5:
+                    last_embed_ts[tid] = now
                     face_crop = _get_face_crop(frame, x1, y1, x2, y2)
                     if face_crop.size > 0:
                         emb = get_embedding(face_crop)
