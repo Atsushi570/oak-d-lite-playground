@@ -478,12 +478,30 @@ with dai.Device() as device:
         # Depth 可視化
         if last_depth_frame is not None:
             d = last_depth_frame
+            invalid_mask = (d == 0) | (d >= 65535) | (d > DEPTH_MAX_MM)
             d_vis = np.clip((DEPTH_MAX_MM - d) / (DEPTH_MAX_MM - DEPTH_MIN_MM) * 255, 0, 255)
-            d_vis[(d == 0) | (d >= 65535) | (d > DEPTH_MAX_MM)] = 0
             colored = cv2.applyColorMap(d_vis.astype(np.uint8), cv2.COLORMAP_JET)
+            colored[invalid_mask] = 0
             for tid, (x1, y1, x2, y2) in matched_dets.items():
                 cv2.rectangle(colored, (x1, y1), (x2, y2), (255, 255, 255), 1)
-            cv2.imshow("Depth", colored)
+            # カラーバー凡例
+            ch = colored.shape[0]
+            bar_w, label_w = 30, 60
+            bar_vals = np.linspace(255, 0, ch).astype(np.uint8).reshape(ch, 1)
+            bar_gray = np.repeat(bar_vals, bar_w, axis=1)
+            bar_color = cv2.applyColorMap(bar_gray, cv2.COLORMAP_JET)
+            label_area = np.zeros((ch, label_w, 3), dtype=np.uint8)
+            labels = [(f"{DEPTH_MIN_MM/1000:.1f}m", 0.05), ("1m", 1000), ("2m", 2000),
+                      ("3m", 3000), ("4m", 4000), (f"{DEPTH_MAX_MM/1000:.0f}m", 0.95)]
+            for txt, pos in labels:
+                if isinstance(pos, float):
+                    y = int(pos * ch)
+                else:
+                    y = int((pos - DEPTH_MIN_MM) / (DEPTH_MAX_MM - DEPTH_MIN_MM) * ch)
+                y = max(12, min(ch - 4, y))
+                cv2.putText(label_area, txt, (2, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+            cv2.imshow("Depth", np.hstack([colored, bar_color, label_area]))
 
         key = cv2.waitKey(1) & 0xFF
 
