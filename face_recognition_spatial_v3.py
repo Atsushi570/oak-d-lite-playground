@@ -192,6 +192,9 @@ def check_liveness_depth(depth_frame, x1, y1, x2, y2, border=30):
         return "SPOOF", {"face": int(face_depth), "bg": 0, "diff": 0, "std": round(face_std, 1), "fpx": fpx, "ratio": round(valid_ratio, 2)}
     face_depth = float(np.median(face_valid))
     face_std = float(np.std(face_valid))
+    # 0.4m 未満はステレオ信頼性低 → SPOOF
+    if face_depth < 400:
+        return "SPOOF", {"face": int(face_depth), "bg": 0, "diff": 0, "std": round(face_std, 1), "fpx": fpx, "ratio": round(valid_ratio, 2)}
     bx1, by1 = max(0, x1 - border), max(0, y1 - border)
     bx2, by2 = min(dw, x2 + border), min(dh, y2 + border)
     bg_full = depth_frame[by1:by2, bx1:bx2].copy()
