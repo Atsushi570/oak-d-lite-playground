@@ -41,7 +41,7 @@ USE_ANTISPOOF = args.antispoof
 use_mono = False
 
 # ─── 赤外線 LED（GPIO6、BCM）────────────────────────────
-IR_LED_GPIO = 6
+IR_LED_GPIO = 17
 _gpio_h = lgpio.gpiochip_open(0)
 lgpio.gpio_claim_output(_gpio_h, IR_LED_GPIO, 0)  # 初期OFF
 ir_led_on = False
