@@ -65,6 +65,12 @@ python3 -c "
 from huggingface_hub import hf_hub_download
 hf_hub_download(repo_id='fal/AuraFace-v1', filename='glintr100.onnx', local_dir='.')
 "
+
+# MiniFASNetV2（liveness detection / anti-spoof - MIT）
+# リポジトリに同梱済み（anti_spoof_mn3.onnx）
+# 自前でビルドする場合:
+# pip install torch --index-url https://download.pytorch.org/whl/cpu
+# python3 scripts/convert_antispoof.py
 ```
 
 ---
@@ -79,7 +85,7 @@ hf_hub_download(repo_id='fal/AuraFace-v1', filename='glintr100.onnx', local_dir=
 | `live_rgb.py` | venv | RGB のみのリアルタイム表示 |
 | `face_recognition.py` | venv | 顔認証（手動深度取得版、depthai 2.x） |
 | `face_recognition_spatial.py` | venv | 顔認証（depthai 2.x・**安定版**） |
-| `face_recognition_spatial_v3.py` | venv3 | 顔認証 SFace（depthai 3.x 対応版） |
+| `face_recognition_spatial_v3.py` | venv3 | 顔認証 SFace + liveness detection（depthai 3.x 対応版、RGB/NIR 切替、ヘッドポーズ推定） |
 | `face_recognition_auraface.py` | venv3 | 顔認証 AuraFace（高精度・Apache 2.0） |
 
 ---
@@ -119,12 +125,22 @@ flowchart TB
 
         switch --> parse["SSD 手動パース\ngetTensor('detection_out')\nreshape(-1, 7)"]
         parse --> track["host-side IoU トラッキング\ntrack_id 割当・TTL管理"]
-        track --> yunet["YuNet\n顔ランドマーク検出\n→ alignCrop 112×112"]
-        yunet --> sface["SFace\ncosine similarity\n→ DB マッチング"]
-        sface --> display["表示\nBBox / ID / 認証結果\nsim:0.xx OK/NG"]
+
+        track --> liveness_d["check_liveness_depth\nvalid_ratio / face_std\n常時有効"]
+        track -.->|"--antispoof 時"| liveness_nn["MiniFASNetV2\nonnxruntime CPU\n1.5秒 rate limit"]
+        liveness_d --> combine["マルチモーダル判定\nLIVE / SPOOF / 保留"]
+        liveness_nn -.-> combine
+
+        track --> pose["estimate_pose\nYuNet + solvePnP(EPNP)\nYaw/Pitch/Roll"]
+
+        track --> yunet["YuNet + SFace\ncosine similarity → DB マッチング\n1.5秒 rate limit"]
+        combine -->|"SPOOF なら認証スキップ"| yunet
+        yunet --> display["表示\nBBox / ID / 認証結果 / 3軸\nsim:0.xx OK/NG"]
 
         q_depth --> depth["深度 ROI\nBBox中心 15×15px 中央値\n→ 距離 mm"]
         depth --> display
+        q_depth --> liveness_d
+        pose --> display
     end
 
     VPU -->|USB 3.0| Host
@@ -181,9 +197,12 @@ flowchart TB
 ## 顔認証の使い方
 
 ```bash
-# SFace (depthai 3.x)
+# SFace (depthai 3.x) — 深度 liveness のみ
 source venv3/bin/activate
 DISPLAY=:0 python3 face_recognition_spatial_v3.py
+
+# MiniFASNetV2 も使うマルチモーダル liveness
+DISPLAY=:0 python3 face_recognition_spatial_v3.py --antispoof
 
 # AuraFace (depthai 3.x)
 source venv3/bin/activate
@@ -208,12 +227,67 @@ rm face_db_auraface.pkl # AuraFace用
 
 ---
 
+## Liveness Detection（アンチスプーフィング）
+
+2チャンネルによるマルチモーダル liveness detection。デフォルトは深度のみ、`--antispoof` で MiniFASNetV2 も有効化。
+
+### 深度チャンネル（常時有効）
+
+以下の順番で判定：
+
+1. `valid_ratio < 30%` → **SPOOF**（有効深度ピクセルが少ない＝反射面・スマホ画面）
+2. `face_depth < 400mm` → **SPOOF**（カメラに近すぎ・ステレオ信頼性低）
+3. `face_std` が 15〜100mm の範囲外 → **SPOOF**（平面 or 背景ノイズ混入）
+4. 上記すべて通過 → **LIVE**
+
+実測値（カメラから 90cm）：
+
+| | face_std | valid_ratio |
+|---|---|---|
+| 実顔 | 27〜33mm | 70〜90% |
+| スマホ画面 | 0.6〜1.4mm | 5〜15% |
+
+### RGB チャンネル（`--antispoof` 時のみ）
+
+MiniFASNetV2（ONNX）をホスト CPU（onnxruntime）で推論。real 確率 > 0.5 で LIVE。1.5秒 rate limit。
+
+### 判定ロジック
+
+- `--antispoof` あり：nn=LIVE AND depth=LIVE → LIVE（両方一致必須）
+- `--antispoof` なし：depth 判定のみ
+- BBox 色：緑=LIVE / 赤=SPOOF / 黄=判定保留
+
+### 注意事項
+
+- NIR モードでも depth チェックは常に RGB（CAM_A）座標の BBox を使用（depth は CAM_A align のため）
+- 背景が白壁・黒髪など無テクスチャ面の場合、valid_ratio が低くなる場合あり
+
+---
+
+## ヘッドポーズ推定
+
+- YuNet 5点ランドマーク → solvePnP(EPNP) → Yaw/Pitch/Roll
+- 顔に3軸描画（X=赤, Y=緑, Z=青）、BBox 下に角度表示
+- キャッシュ更新は毎フレーム（~10fps）
+
+---
+
 ## チューニングパラメータ
 
 ```python
+# 認証
 MIN_FACE_WIDTH       = 40     # 認証する最小顔幅 (px) ← 40で約2m前後まで対応
 SIMILARITY_THRESHOLD = 0.65   # 同一人物判定ライン (0〜1、高いほど厳しい)
-EMBED_INTERVAL       = 1.5    # AuraFace: 同一顔の再推論間隔 (秒)
+EMBED_INTERVAL       = 1.5    # SFace/AuraFace: 同一顔の再推論間隔 (秒)
+
+# Liveness Detection（深度チャンネル）
+LIVENESS_VALID_RATIO = 0.3    # 有効深度ピクセル比率の下限
+LIVENESS_MIN_DEPTH_MM= 400    # face_depth 最小値: これ未満は SPOOF
+LIVENESS_STD_MIN     = 15.0   # face_std 下限: 平面判定閾値 (mm)
+LIVENESS_STD_MAX     = 100.0  # face_std 上限: 背景ノイズ除外閾値 (mm)
+DEPTH_BORDER_PX      = 30     # 背景 ROI: BBox 外周何 px か
+
+# 深度マップ表示
 DEPTH_MIN_MM         = 200    # 深度マップ表示の最小距離 (mm)
 DEPTH_MAX_MM         = 5000   # 深度マップ表示の最大距離 (mm)
 ```
@@ -224,6 +298,9 @@ DEPTH_MAX_MM         = 5000   # 深度マップ表示の最大距離 (mm)
 - **depthai 2.27.0 を推奨**: 3.x は ISP firmware クラッシュの回避策として Camera ノードを使用
 - **NIR 登録推奨**: NIR モードで登録すると昼夜どちらでも認識精度が高い
 - **OAK-D Lite は IR カメラ非搭載**: NIR は 940nm 外部照明 + モノカメラで代替
+- **ステレオ深度と無テクスチャ面**: OAK-D Lite のステレオ深度は白壁・黒髪など無テクスチャ面のマッチングが失敗する（深度ウィンドウで黒く表示）
+- **setExtendedDisparity と setSubpixel は排他**: Subpixel を優先して使用
+- **MinZ は 400P 相当で約 40cm**: これより近い対象はステレオ深度が取れない
 
 ## モデル・ライセンス
 
@@ -233,3 +310,4 @@ DEPTH_MAX_MM         = 5000   # 深度マップ表示の最大距離 (mm)
 | SFace | Apache 2.0 | ✅ |
 | YuNet | MIT | ✅ |
 | AuraFace (glintr100) | Apache 2.0 | ✅ |
+| MiniFASNetV2 (anti-spoof) | MIT | ✅ |
