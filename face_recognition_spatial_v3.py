@@ -585,7 +585,9 @@ with dai.Device() as device:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
             cv2.imshow("Depth", np.hstack([colored, bar_color, label_area]))
 
-        key = cv2.waitKey(1) & 0xFF
+        # 顔がいないときはスリープを長くして CPU 節約
+        wait_ms = 1 if matched_dets else 30
+        key = cv2.waitKey(wait_ms) & 0xFF
 
         if key == ord('m'):
             use_mono = not use_mono
