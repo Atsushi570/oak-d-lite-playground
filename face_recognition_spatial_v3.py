@@ -38,8 +38,6 @@ DB_PATH              = "face_db.pkl"
 DEPTH_MIN_MM         = 200
 DEPTH_MAX_MM         = 5000
 RESULT_TTL           = 2.0
-LIVENESS_DEPTH_STD_MIN = 12.0   # 平面残差 std(mm)の下限
-LIVENESS_VALID_RATIO   = 0.3    # 有効深度ピクセル比率の下限
 TRACK_IOU_THRESH     = 0.3
 TRACK_TTL            = 1.0
 
@@ -173,49 +171,44 @@ def estimate_pose(frame, x1, y1, x2, y2):
     }
 
 
-def check_liveness_depth(depth_frame, x1, y1, x2, y2):
-    """深度平面フィッティングで liveness 判定。
-    実顔(凹凸あり)='LIVE', 平面(写真/画面)='SPOOF', 判定不能=None"""
+def check_liveness_depth(depth_frame, x1, y1, x2, y2, border=30):
+    """顔/背景 深度差分チェック"""
     if depth_frame is None:
         return None
     dh, dw = depth_frame.shape[:2]
-    roi = depth_frame[max(0, y1):min(dh, y2), max(0, x1):min(dw, x2)]
-    if roi.size == 0:
+    # 顔領域
+    fx1, fy1 = max(0, x1), max(0, y1)
+    fx2, fy2 = min(dw, x2), min(dh, y2)
+    face_roi = depth_frame[fy1:fy2, fx1:fx2]
+    face_valid = face_roi[(face_roi > 100) & (face_roi < 4000)]
+    if face_valid.size < 20:
         return None
-
-    total_pixels = roi.size
-    valid_mask = (roi > 100) & (roi < 10000)
-    valid_ratio = np.count_nonzero(valid_mask) / total_pixels
-
-    # 有効率 < 10% → 反射面 (SPOOF)
-    if valid_ratio < 0.1:
-        return "SPOOF"
-
-    valid_vals = roi[valid_mask]
-    med = np.median(valid_vals)
-
-    # 中央値 ± 200mm で背景排除
-    ys, xs = np.where(valid_mask & (np.abs(roi - med) < 200))
-    if len(ys) / total_pixels < LIVENESS_VALID_RATIO:
+    face_depth = float(np.median(face_valid))
+    # ボーダー領域 (BBox外周30px)
+    bx1, by1 = max(0, x1 - border), max(0, y1 - border)
+    bx2, by2 = min(dw, x2 + border), min(dh, y2 + border)
+    bg_full = depth_frame[by1:by2, bx1:bx2].copy()
+    # 顔領域をマスク
+    bg_full[fy1 - by1:fy2 - by1, fx1 - bx1:fx2 - bx1] = 0
+    bg_valid = bg_full[(bg_full > 100) & (bg_full < 4000)]
+    if bg_valid.size < 20:
         return None
-
-    z = roi[ys, xs].astype(np.float64)
-    A = np.column_stack([xs.astype(np.float64), ys.astype(np.float64),
-                         np.ones(len(xs))])
-    result = np.linalg.lstsq(A, z, rcond=None)
-    residuals = z - A @ result[0]
-    std = np.std(residuals)
-
-    return "LIVE" if std >= LIVENESS_DEPTH_STD_MIN else "SPOOF"
+    bg_depth = float(np.median(bg_valid))
+    # 背景が200mm以上遠ければ前景判定
+    return "LIVE" if (bg_depth - face_depth) > 200 else "SPOOF"
 
 
 # ─── Blob ─────────────────────────────────────────────
-blob_path = str(__import__('blobconverter').from_zoo(
+import blobconverter
+blob_path = str(blobconverter.from_zoo(
     name="face-detection-retail-0004", shaves=6))
+antispoof_blob = str(blobconverter.from_zoo(
+    name="anti-spoof-mn3", shaves=6))
 
 # ─── 状態変数 ──────────────────────────────────────────
 track_results    = {}
 last_depth_cache = {}
+last_nn_live     = None   # anti-spoof NN の最新結果キャッシュ
 
 print("[RGB mode] (m で NIR に切替)")
 print("起動中... (3秒待機)")
@@ -275,12 +268,23 @@ with dai.Device() as device:
     det_nn_nir.setBlobPath(blob_path)
     manip_nir.out.link(det_nn_nir.input)
 
+    # ─── Anti-spoof NN (RGB全体を128x128にリサイズ) ──
+    rgb_spoof = cam_color.requestOutput((640, 400), type=dai.ImgFrame.Type.BGR888p, fps=10)
+    manip_spoof = p.create(dai.node.ImageManip)
+    manip_spoof.initialConfig.setOutputSize(128, 128)
+    manip_spoof.initialConfig.setFrameType(dai.ImgFrame.Type.BGR888p)
+    rgb_spoof.link(manip_spoof.inputImage)
+    nn_spoof = p.create(dai.node.NeuralNetwork)
+    nn_spoof.setBlobPath(antispoof_blob)
+    manip_spoof.out.link(nn_spoof.input)
+
     # ─── キュー ───────────────────────────────────────
     q_rgb   = rgb_disp.createOutputQueue(maxSize=4, blocking=False)
     q_mono  = mono_out_l.createOutputQueue(maxSize=4, blocking=False)
     q_nn     = det_nn.out.createOutputQueue(maxSize=4, blocking=False)
     q_nn_nir = det_nn_nir.out.createOutputQueue(maxSize=4, blocking=False)
     q_depth = stereo.depth.createOutputQueue(maxSize=4, blocking=False)
+    q_spoof = nn_spoof.out.createOutputQueue(maxSize=4, blocking=False)
     p.start()
 
     frame           = None
@@ -304,6 +308,15 @@ with dai.Device() as device:
         in_depth = q_depth.tryGet()
         if in_depth is not None:
             last_depth_frame = in_depth.getFrame().astype(np.float32)
+
+        # anti-spoof NN 出力
+        in_spoof = q_spoof.tryGet()
+        if in_spoof is not None:
+            try:
+                probs = np.array(in_spoof.getFirstTensor()).flatten()
+                last_nn_live = "LIVE" if probs[0] > 0.5 else "SPOOF"
+            except Exception:
+                pass  # tensor 取得失敗時はキャッシュを保持
 
         # NN出力: SSD手動パース (1,1,200,7) → [img_id, label, conf, x1,y1,x2,y2]
         in_nn = (q_nn_nir if use_mono else q_nn).tryGet()
@@ -353,7 +366,17 @@ with dai.Device() as device:
 
             for tid, (x1, y1, x2, y2) in matched_dets.items():
                 quality = is_quality_face(x1, y1, x2, y2, fw, fh)
-                liveness = check_liveness_depth(last_depth_frame, x1, y1, x2, y2)
+                depth_live = check_liveness_depth(last_depth_frame, x1, y1, x2, y2)
+                nn_result = last_nn_live
+                # マルチモーダル判定
+                if nn_result == "SPOOF" or depth_live == "SPOOF":
+                    liveness = "SPOOF"
+                elif nn_result == "LIVE" and depth_live in ("LIVE", None):
+                    liveness = "LIVE"
+                elif nn_result is None and depth_live == "LIVE":
+                    liveness = "LIVE"
+                else:
+                    liveness = None
                 if liveness == "LIVE":
                     color = (0, 200, 0)
                 elif liveness == "SPOOF":
@@ -364,8 +387,9 @@ with dai.Device() as device:
                 cv2.putText(display, f"ID:{tid}", (x1, y1-5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                 if liveness:
-                    cv2.putText(display, liveness, (x1, y1-20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    lbl_detail = f"{liveness} nn:{nn_result or '?'} d:{depth_live or '?'}"
+                    cv2.putText(display, lbl_detail, (x1, y1-20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 
                 # ヘッドポーズ推定
                 pose = estimate_pose(frame, x1, y1, x2, y2)
